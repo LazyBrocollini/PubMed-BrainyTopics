@@ -5,7 +5,7 @@ import time
 import feedparser
 from datetime import datetime
 import xml.etree.ElementTree as ET
-import urllib.parse  # ✅ NEW (for URL encoding)
+import urllib.parse
 
 # --- CONFIG ---
 RATE_LIMIT_DELAY = 0.4
@@ -14,20 +14,22 @@ st.set_page_config(page_title="PubMed Smart Fetcher", layout="wide")
 st.title("🔬 PubMed Smart Fetcher (RSS + API Hybrid)")
 
 # --- INPUTS ---
-keywords = st.text_input("Enter keywords")
+keywords = st.text_input("Enter keywords (e.g., cancer immunotherapy)")
 start_date = st.date_input("Start date", datetime(2023, 1, 1))
 end_date = st.date_input("End date", datetime.today())
 max_results = st.slider("Max results", 10, 100, 30)
 fetch_full = st.checkbox("Fetch full abstracts (uses API)", value=False)
 
-# --- ✅ FIX #1: SAFE RSS URL BUILDER ---
+# --- ✅ FIXED RSS BUILDER ---
 def build_rss_url(query, start_date, end_date, max_results):
     base = "https://pubmed.ncbi.nlm.nih.gov/rss/search/"
 
-    raw_query = f"{query} AND ({start_date.strftime('%Y/%m/%d')}:{end_date.strftime('%Y/%m/%d')}[dp])"
-    
-    # Encode the query to prevent URL breakage
-    encoded_query = urllib.parse.quote(raw_query)
+    formatted_query = (
+        f"({query}[Title/Abstract]) AND "
+        f"({start_date.strftime('%Y/%m/%d')}[dp] : {end_date.strftime('%Y/%m/%d')}[dp])"
+    )
+
+    encoded_query = urllib.parse.quote(formatted_query)
 
     return f"{base}?term={encoded_query}&size={max_results}"
 
@@ -65,7 +67,7 @@ def fetch_rss_data(rss_url):
 
         articles.append({
             "Title": entry.title,
-            "Published": getattr(entry, "published", "N/A"),  # safer
+            "Published": getattr(entry, "published", "N/A"),
             "Summary": entry.summary,
             "PMID": pmid,
             "Link": link
@@ -73,7 +75,29 @@ def fetch_rss_data(rss_url):
 
     return pd.DataFrame(articles), ids
 
-# --- ✅ FIX #2: SAFE XML PARSING ---
+# --- ✅ FALLBACK API SEARCH ---
+@st.cache_data(ttl=3600)
+def fallback_search(query, start_date, end_date, max_results):
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+
+    params = {
+        "db": "pubmed",
+        "term": f"{query}[Title/Abstract]",
+        "retmax": max_results,
+        "retmode": "json",
+        "mindate": start_date.strftime("%Y/%m/%d"),
+        "maxdate": end_date.strftime("%Y/%m/%d"),
+        "datetype": "pdat"
+    }
+
+    response = safe_request(url, params)
+    if not response:
+        return []
+
+    data = response.json()
+    return data.get("esearchresult", {}).get("idlist", [])
+
+# --- SAFE XML FETCH ---
 @st.cache_data(ttl=3600)
 def fetch_full_details(id_list):
     if not id_list:
@@ -92,7 +116,7 @@ def fetch_full_details(id_list):
         return pd.DataFrame()
 
     try:
-        root = ET.fromstring(response.text)  # ⚠️ can fail → now protected
+        root = ET.fromstring(response.text)
     except ET.ParseError:
         return pd.DataFrame()
 
@@ -119,27 +143,42 @@ def fetch_full_details(id_list):
 
 # --- MAIN ---
 if st.button("Search"):
+    if not keywords:
+        st.warning("Please enter keywords.")
+        st.stop()
+
     with st.spinner("Fetching via RSS..."):
         rss_url = build_rss_url(keywords, start_date, end_date, max_results)
 
-        # Debug helper (optional)
-        # st.write("RSS URL:", rss_url)
+        # ✅ OPTIONAL DEBUG (very useful on Streamlit Cloud)
+        st.write("RSS URL:", rss_url)
 
         df, ids = fetch_rss_data(rss_url)
 
-    if df.empty:
-        st.warning("No results found.")
-    else:
-        st.success(f"Found {len(df)} articles")
+    # --- ✅ FALLBACK LOGIC ---
+    if df.empty or not ids:
+        st.warning("RSS returned no results — falling back to API search...")
 
-        if fetch_full:
-            with st.spinner("Fetching full abstracts..."):
-                details_df = fetch_full_details(ids)
+        ids = fallback_search(keywords, start_date, end_date, max_results)
 
-            if not details_df.empty:
-                df = df.merge(details_df, on="PMID", how="left")
+        if not ids:
+            st.error("No results found.")
+            st.stop()
 
-        st.dataframe(df, use_container_width=True)
+        # Create minimal dataframe from IDs
+        df = pd.DataFrame({"PMID": ids})
 
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", csv, "pubmed_results.csv", "text/csv")
+    st.success(f"Found {len(df)} articles")
+
+    # --- OPTIONAL FULL ABSTRACT FETCH ---
+    if fetch_full:
+        with st.spinner("Fetching full abstracts (API)..."):
+            details_df = fetch_full_details(ids)
+
+        if not details_df.empty:
+            df = df.merge(details_df, on="PMID", how="left")
+
+    st.dataframe(df, use_container_width=True)
+
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV", csv, "pubmed_results.csv", "text/csv")
