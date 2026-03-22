@@ -5,9 +5,10 @@ import time
 import feedparser
 from datetime import datetime
 import xml.etree.ElementTree as ET
+import urllib.parse  # ✅ NEW (for URL encoding)
 
 # --- CONFIG ---
-RATE_LIMIT_DELAY = 0.4  # safe without API key
+RATE_LIMIT_DELAY = 0.4
 
 st.set_page_config(page_title="PubMed Smart Fetcher", layout="wide")
 st.title("🔬 PubMed Smart Fetcher (RSS + API Hybrid)")
@@ -19,20 +20,23 @@ end_date = st.date_input("End date", datetime.today())
 max_results = st.slider("Max results", 10, 100, 30)
 fetch_full = st.checkbox("Fetch full abstracts (uses API)", value=False)
 
-# --- BUILD RSS URL ---
+# --- ✅ FIX #1: SAFE RSS URL BUILDER ---
 def build_rss_url(query, start_date, end_date, max_results):
     base = "https://pubmed.ncbi.nlm.nih.gov/rss/search/"
 
-    formatted_query = f"{query} AND ({start_date.strftime('%Y/%m/%d')}:{end_date.strftime('%Y/%m/%d')}[dp])"
+    raw_query = f"{query} AND ({start_date.strftime('%Y/%m/%d')}:{end_date.strftime('%Y/%m/%d')}[dp])"
+    
+    # Encode the query to prevent URL breakage
+    encoded_query = urllib.parse.quote(raw_query)
 
-    return f"{base}?term={formatted_query}&size={max_results}"
+    return f"{base}?term={encoded_query}&size={max_results}"
 
 # --- SAFE REQUEST ---
 def safe_request(url, params=None, retries=3):
     for attempt in range(retries):
         try:
             time.sleep(RATE_LIMIT_DELAY)
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=20)
 
             if response.status_code == 200:
                 return response
@@ -45,7 +49,7 @@ def safe_request(url, params=None, retries=3):
 
     return None
 
-# --- RSS FETCH (CACHED) ---
+# --- RSS FETCH ---
 @st.cache_data(ttl=3600)
 def fetch_rss_data(rss_url):
     feed = feedparser.parse(rss_url)
@@ -54,7 +58,6 @@ def fetch_rss_data(rss_url):
     ids = []
 
     for entry in feed.entries:
-        # Extract PubMed ID from link
         link = entry.link
         pmid = link.rstrip("/").split("/")[-1]
 
@@ -62,7 +65,7 @@ def fetch_rss_data(rss_url):
 
         articles.append({
             "Title": entry.title,
-            "Published": entry.published,
+            "Published": getattr(entry, "published", "N/A"),  # safer
             "Summary": entry.summary,
             "PMID": pmid,
             "Link": link
@@ -70,7 +73,7 @@ def fetch_rss_data(rss_url):
 
     return pd.DataFrame(articles), ids
 
-# --- API FETCH (CACHED) ---
+# --- ✅ FIX #2: SAFE XML PARSING ---
 @st.cache_data(ttl=3600)
 def fetch_full_details(id_list):
     if not id_list:
@@ -88,7 +91,11 @@ def fetch_full_details(id_list):
     if not response:
         return pd.DataFrame()
 
-    root = ET.fromstring(response.text)
+    try:
+        root = ET.fromstring(response.text)  # ⚠️ can fail → now protected
+    except ET.ParseError:
+        return pd.DataFrame()
+
     articles = []
 
     for article in root.findall(".//PubmedArticle"):
@@ -110,38 +117,29 @@ def fetch_full_details(id_list):
 
     return pd.DataFrame(articles)
 
-# --- SPAM PROTECTION ---
-if "last_run" not in st.session_state:
-    st.session_state.last_run = 0
-
+# --- MAIN ---
 if st.button("Search"):
-    now = time.time()
+    with st.spinner("Fetching via RSS..."):
+        rss_url = build_rss_url(keywords, start_date, end_date, max_results)
 
-    if now - st.session_state.last_run < 2:
-        st.warning("Please wait before searching again.")
-    elif not keywords:
-        st.warning("Enter keywords.")
+        # Debug helper (optional)
+        # st.write("RSS URL:", rss_url)
+
+        df, ids = fetch_rss_data(rss_url)
+
+    if df.empty:
+        st.warning("No results found.")
     else:
-        st.session_state.last_run = now
+        st.success(f"Found {len(df)} articles")
 
-        with st.spinner("Fetching via RSS (fast & efficient)..."):
-            rss_url = build_rss_url(keywords, start_date, end_date, max_results)
-            df, ids = fetch_rss_data(rss_url)
+        if fetch_full:
+            with st.spinner("Fetching full abstracts..."):
+                details_df = fetch_full_details(ids)
 
-        if df.empty:
-            st.warning("No results found.")
-        else:
-            st.success(f"Found {len(df)} articles (RSS)")
+            if not details_df.empty:
+                df = df.merge(details_df, on="PMID", how="left")
 
-            # --- OPTIONAL API ENRICHMENT ---
-            if fetch_full:
-                with st.spinner("Fetching full abstracts (1 API call)..."):
-                    details_df = fetch_full_details(ids)
+        st.dataframe(df, use_container_width=True)
 
-                if not details_df.empty:
-                    df = df.merge(details_df, on="PMID", how="left")
-
-            st.dataframe(df, use_container_width=True)
-
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", csv, "pubmed_results.csv", "text/csv")
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, "pubmed_results.csv", "text/csv")
