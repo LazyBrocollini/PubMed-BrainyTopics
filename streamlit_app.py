@@ -95,8 +95,7 @@ def fallback_search(query, start_date, end_date, max_results):
         return []
 
     data = response.json()
-    return data.get("esearchresult", {}).get("idlist", []).get("term",{})
-    #vm added trying to get titles for the table
+    return data.get("esearchresult", {}).get("idlist", [])
 
 # --- SAFE XML FETCH ---
 @st.cache_data(ttl=3600)
